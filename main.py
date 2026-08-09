@@ -1067,6 +1067,271 @@ async def sanitize_output(request: Request):
 
 
 # =========================================================
+# 4. CORROBORATION SERVICE
+# =========================================================
+
+from datetime import datetime, timezone, timedelta
+
+
+CORROBORATION_SOURCE_TYPES = {
+    "dns",
+    "ct_log",
+    "registry",
+    "archive",
+    "scan",
+}
+
+
+def corroboration_response(verdict, confidence, sources):
+    return {
+        "verdict": verdict,
+        "confidence": confidence,
+        "corroboratingSources": sources,
+    }
+
+
+def parse_timestamp(value):
+    if not isinstance(value, str):
+        return None
+
+    try:
+        # Support normal ISO 8601 Z timestamps
+        if value.endswith("Z"):
+            value = value[:-1] + "+00:00"
+
+        dt = datetime.fromisoformat(value)
+
+        # Require a timezone-aware timestamp
+        if dt.tzinfo is None:
+            return None
+
+        return dt.astimezone(timezone.utc)
+
+    except (ValueError, TypeError, OverflowError):
+        return None
+
+
+def valid_corroboration_source(source):
+    if not isinstance(source, dict):
+        return False
+
+    if not isinstance(source.get("id"), str):
+        return False
+
+    if not isinstance(source.get("origin"), str):
+        return False
+
+    if not isinstance(source.get("value"), str):
+        return False
+
+    if not isinstance(source.get("observedAt"), str):
+        return False
+
+    if source.get("type") not in CORROBORATION_SOURCE_TYPES:
+        return False
+
+    return True
+
+
+def evaluate_corroboration(data):
+
+    # =====================================================
+    # 1. INVALID
+    # =====================================================
+
+    if not isinstance(data, dict):
+        return corroboration_response(
+            "invalid",
+            "low",
+            [],
+        )
+
+    claim = data.get("claim")
+
+    if not isinstance(claim, dict):
+        return corroboration_response(
+            "invalid",
+            "low",
+            [],
+        )
+
+    claim_value = claim.get("value")
+
+    if not isinstance(claim_value, str):
+        return corroboration_response(
+            "invalid",
+            "low",
+            [],
+        )
+
+    as_of = parse_timestamp(data.get("asOf"))
+
+    if as_of is None:
+        return corroboration_response(
+            "invalid",
+            "low",
+            [],
+        )
+
+    staleness_days = data.get("stalenessDays")
+
+    # JSON booleans are not numbers for this policy.
+    if (
+        isinstance(staleness_days, bool)
+        or not isinstance(staleness_days, (int, float))
+    ):
+        return corroboration_response(
+            "invalid",
+            "low",
+            [],
+        )
+
+    sources = data.get("sources")
+
+    if not isinstance(sources, list):
+        return corroboration_response(
+            "invalid",
+            "low",
+            [],
+        )
+
+    # =====================================================
+    # FILTER TO VALID + FRESH SOURCES
+    # =====================================================
+
+    fresh_sources = []
+
+    max_age = timedelta(days=staleness_days)
+
+    for source in sources:
+
+        # Invalid sources are ignored entirely.
+        if not valid_corroboration_source(source):
+            continue
+
+        observed_at = parse_timestamp(
+            source["observedAt"]
+        )
+
+        # An unparseable source timestamp cannot establish freshness,
+        # so this source carries no weight.
+        if observed_at is None:
+            continue
+
+        age = as_of - observed_at
+
+        # Rule:
+        # Fresh when asOf - observedAt <= stalenessDays.
+        #
+        # Future observations therefore also satisfy the literal rule.
+        if age <= max_age:
+            fresh_sources.append(source)
+
+    # =====================================================
+    # 2. CONTRADICTED
+    # =====================================================
+
+    contradicting_ids = []
+
+    for source in fresh_sources:
+
+        if (
+            source.get("authoritative") is True
+            and source["value"] != claim_value
+        ):
+            contradicting_ids.append(
+                source["id"]
+            )
+
+    if contradicting_ids:
+        return corroboration_response(
+            "contradicted",
+            "low",
+            sorted(contradicting_ids),
+        )
+
+    # =====================================================
+    # 3. SUPPORTED
+    # Keep only fresh sources matching the claim.
+    # Reduce to one representative per origin.
+    # Representative = lexicographically smallest id.
+    # =====================================================
+
+    matching_sources = [
+        source
+        for source in fresh_sources
+        if source["value"] == claim_value
+    ]
+
+    representatives_by_origin = {}
+
+    for source in matching_sources:
+
+        origin = source["origin"]
+
+        if origin not in representatives_by_origin:
+            representatives_by_origin[origin] = source
+
+        else:
+            current = representatives_by_origin[origin]
+
+            if source["id"] < current["id"]:
+                representatives_by_origin[origin] = source
+
+    representatives = list(
+        representatives_by_origin.values()
+    )
+
+    if len(representatives) >= 2:
+
+        representative_types = {
+            source["type"]
+            for source in representatives
+        }
+
+        if len(representative_types) >= 2:
+            confidence = "high"
+        else:
+            confidence = "medium"
+
+        ids = sorted(
+            source["id"]
+            for source in representatives
+        )
+
+        return corroboration_response(
+            "supported",
+            confidence,
+            ids,
+        )
+
+    # =====================================================
+    # 4. UNVERIFIED
+    # =====================================================
+
+    return corroboration_response(
+        "unverified",
+        "low",
+        [],
+    )
+
+
+@app.post("/corroborate")
+async def corroborate(request: Request):
+
+    try:
+        data = await request.json()
+
+    except Exception:
+        return corroboration_response(
+            "invalid",
+            "low",
+            [],
+        )
+
+    return evaluate_corroboration(data)
+
+# =========================================================
 # HEALTH CHECK
 # =========================================================
 
