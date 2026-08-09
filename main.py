@@ -477,3 +477,408 @@ async def action_firewall(request: Request):
 @app.get("/")
 def root():
     return {"ok": True}
+
+# -------------------------------------------------
+# MODEL OUTPUT SANITIZER
+# -------------------------------------------------
+
+import re
+from urllib.parse import unquote, urlsplit
+
+SANITIZER_ALLOWED_HOSTS = {
+    "cdn-bp1t5xs.example",
+    "app-5z1e5jh.example",
+}
+
+SANITIZER_CHANNELS = {
+    "html",
+    "markdown",
+    "url",
+    "sql",
+    "shell",
+}
+
+
+def sanitize_response(reason):
+    return {
+        "safe": reason == "SAFE",
+        "reason": reason,
+    }
+
+
+# -------------------------------------------------
+# Decode exactly once:
+# 1. percent escapes
+# 2. specified HTML entities
+# 3. \uXXXX escapes
+# -------------------------------------------------
+
+def decode_html_entities_once(text):
+
+    named = {
+        "lt": "<",
+        "gt": ">",
+        "quot": '"',
+        "apos": "'",
+        "amp": "&",
+    }
+
+    pattern = re.compile(
+        r"&(?:#([0-9]+)|#x([0-9a-fA-F]+)|(lt|gt|quot|apos|amp));"
+    )
+
+    def replace(match):
+        try:
+            if match.group(1) is not None:
+                return chr(int(match.group(1), 10))
+
+            if match.group(2) is not None:
+                return chr(int(match.group(2), 16))
+
+            if match.group(3) is not None:
+                return named[match.group(3)]
+
+        except (ValueError, OverflowError):
+            return match.group(0)
+
+        return match.group(0)
+
+    return pattern.sub(replace, text)
+
+
+def decode_unicode_escapes_once(text):
+
+    def replace(match):
+        try:
+            return chr(int(match.group(1), 16))
+        except (ValueError, OverflowError):
+            return match.group(0)
+
+    return re.sub(
+        r"\\u([0-9a-fA-F]{4})",
+        replace,
+        text,
+    )
+
+
+def decode_once(text):
+    # Required order
+    result = unquote(text)
+    result = decode_html_entities_once(result)
+    result = decode_unicode_escapes_once(result)
+    return result
+
+
+# -------------------------------------------------
+# URL extraction
+# -------------------------------------------------
+
+def extract_html_urls(text):
+    urls = []
+
+    pattern = re.compile(
+        r"""\b(?:src|href)\s*=\s*(["'])(.*?)\1""",
+        re.IGNORECASE | re.DOTALL,
+    )
+
+    for match in pattern.finditer(text):
+        urls.append(match.group(2).strip())
+
+    return urls
+
+
+def extract_markdown_urls(text):
+    urls = []
+
+    # Extract target inside ](...)
+    pattern = re.compile(
+        r"\]\(\s*([^)]+?)\s*\)",
+        re.DOTALL,
+    )
+
+    for match in pattern.finditer(text):
+        target = match.group(1).strip()
+
+        # Markdown may wrap a URL in angle brackets
+        if target.startswith("<") and target.endswith(">"):
+            target = target[1:-1].strip()
+
+        urls.append(target)
+
+    return urls
+
+
+def extracted_urls(channel, text):
+
+    if channel == "html":
+        return extract_html_urls(text)
+
+    if channel == "markdown":
+        return extract_markdown_urls(text)
+
+    if channel == "url":
+        return [text.strip()]
+
+    return []
+
+
+# -------------------------------------------------
+# URL policy
+# -------------------------------------------------
+
+def has_dangerous_scheme(text, urls):
+
+    # Explicitly forbidden schemes anywhere in the text,
+    # allowing whitespace immediately before ":"
+    if re.search(
+        r"(?:javascript|data|vbscript)\s*:",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        return True
+
+    # Extracted URLs may only use http/https when a scheme exists
+    for value in urls:
+        value = value.strip()
+
+        # Protocol-relative URLs have no explicit scheme and are
+        # handled by EXTERNAL_EXFIL.
+        if value.startswith("//"):
+            continue
+
+        scheme_match = re.match(
+            r"^([A-Za-z][A-Za-z0-9+.-]*):",
+            value,
+        )
+
+        if scheme_match:
+            scheme = scheme_match.group(1).lower()
+
+            if scheme not in {"http", "https"}:
+                return True
+
+    return False
+
+
+def has_external_exfil(urls):
+
+    for value in urls:
+        value = value.strip()
+
+        # Protocol-relative reference counts as absolute.
+        if value.startswith("//"):
+            parsed = urlsplit("https:" + value)
+
+            hostname = parsed.hostname
+
+            if hostname is None:
+                return True
+
+            if hostname.lower() not in SANITIZER_ALLOWED_HOSTS:
+                return True
+
+            continue
+
+        # Detect explicit URL schemes
+        scheme_match = re.match(
+            r"^([A-Za-z][A-Za-z0-9+.-]*):",
+            value,
+        )
+
+        if not scheme_match:
+            # Relative reference such as /local/page
+            continue
+
+        scheme = scheme_match.group(1).lower()
+
+        # Non-http(s) schemes are handled by DANGEROUS_SCHEME,
+        # so don't classify them as EXTERNAL_EXFIL here.
+        if scheme not in {"http", "https"}:
+            continue
+
+        try:
+            parsed = urlsplit(value)
+        except ValueError:
+            return True
+
+        hostname = parsed.hostname
+
+        if hostname is None:
+            return True
+
+        # EXACT hostname comparison: no substring or subdomain match.
+        if hostname.lower() not in SANITIZER_ALLOWED_HOSTS:
+            return True
+
+    return False
+
+
+# -------------------------------------------------
+# Channel-specific checks
+# -------------------------------------------------
+
+def html_violation(text):
+
+    # SCRIPT_TAG
+    if re.search(
+        r"<\s*(?:script|iframe|object|embed)\b",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        return "SCRIPT_TAG"
+
+    # EVENT_HANDLER
+    # Look only inside HTML-looking tags.
+    tags = re.findall(r"<[^>]+>", text, flags=re.DOTALL)
+
+    for tag in tags:
+        if re.search(
+            r"\bon[^\s=/>]*\s*=",
+            tag,
+            flags=re.IGNORECASE,
+        ):
+            return "EVENT_HANDLER"
+
+    urls = extract_html_urls(text)
+
+    # DANGEROUS_SCHEME
+    if has_dangerous_scheme(text, urls):
+        return "DANGEROUS_SCHEME"
+
+    # EXTERNAL_EXFIL
+    if has_external_exfil(urls):
+        return "EXTERNAL_EXFIL"
+
+    return "SAFE"
+
+
+def markdown_violation(text):
+    urls = extract_markdown_urls(text)
+
+    if has_dangerous_scheme(text, urls):
+        return "DANGEROUS_SCHEME"
+
+    if has_external_exfil(urls):
+        return "EXTERNAL_EXFIL"
+
+    return "SAFE"
+
+
+def url_violation(text):
+    urls = [text.strip()]
+
+    if has_dangerous_scheme(text, urls):
+        return "DANGEROUS_SCHEME"
+
+    if has_external_exfil(urls):
+        return "EXTERNAL_EXFIL"
+
+    return "SAFE"
+
+
+def sql_violation(text):
+
+    # single quote or double quote or semicolon
+    if "'" in text or '"' in text or ";" in text:
+        return "SQL_METACHAR"
+
+    # -- or /*
+    if "--" in text or "/*" in text:
+        return "SQL_METACHAR"
+
+    # word UNION
+    if re.search(r"\bunion\b", text, flags=re.IGNORECASE):
+        return "SQL_METACHAR"
+
+    # OR 1=1, allowing normal whitespace variations
+    if re.search(
+        r"\bor\s+1\s*=\s*1\b",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        return "SQL_METACHAR"
+
+    return "SAFE"
+
+
+def shell_violation(text):
+
+    # ; & | ` < >
+    if re.search(r"[;&|`<>]", text):
+        return "SHELL_METACHAR"
+
+    # $( or ${
+    if "$(" in text or "${" in text:
+        return "SHELL_METACHAR"
+
+    return "SAFE"
+
+
+def channel_violation(channel, text):
+
+    if channel == "html":
+        return html_violation(text)
+
+    if channel == "markdown":
+        return markdown_violation(text)
+
+    if channel == "url":
+        return url_violation(text)
+
+    if channel == "sql":
+        return sql_violation(text)
+
+    if channel == "shell":
+        return shell_violation(text)
+
+    return "SAFE"
+
+
+# -------------------------------------------------
+# Main sanitizer policy
+# -------------------------------------------------
+
+def evaluate_sanitizer(data):
+
+    # 1. INVALID_SCHEMA
+    if not isinstance(data, dict):
+        return sanitize_response("INVALID_SCHEMA")
+
+    channel = data.get("channel")
+    output = data.get("output")
+
+    if channel not in SANITIZER_CHANNELS:
+        return sanitize_response("INVALID_SCHEMA")
+
+    if not isinstance(output, str):
+        return sanitize_response("INVALID_SCHEMA")
+
+    if len(output) > 20000:
+        return sanitize_response("INVALID_SCHEMA")
+
+
+    # 2. ENCODED_PAYLOAD
+    decoded = decode_once(output)
+
+    if decoded != output:
+        decoded_reason = channel_violation(channel, decoded)
+
+        if decoded_reason != "SAFE":
+            return sanitize_response("ENCODED_PAYLOAD")
+
+
+    # 3. Channel-specific rules on ORIGINAL output
+    reason = channel_violation(channel, output)
+
+    return sanitize_response(reason)
+
+
+@app.post("/sanitize-output")
+async def sanitize_output(request: Request):
+
+    try:
+        data = await request.json()
+    except Exception:
+        return sanitize_response("INVALID_SCHEMA")
+
+    return evaluate_sanitizer(data)
