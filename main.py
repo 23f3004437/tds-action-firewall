@@ -8,7 +8,7 @@ app = FastAPI()
 
 
 # =========================================================
-# ACTION FIREWALL
+# 1. ACTION FIREWALL
 # =========================================================
 
 TENANT = "tenant-wwf4cuv"
@@ -35,9 +35,8 @@ class SafetyParser(HTMLParser):
         self.unsafe = False
 
     def handle_starttag(self, tag, attrs):
-        tag = tag.lower()
+        tag = (tag or "").lower()
 
-        # Firewall question specifically forbids scripts and iframes
         if tag in {"script", "iframe"}:
             self.unsafe = True
             return
@@ -46,12 +45,10 @@ class SafetyParser(HTMLParser):
             name = (name or "").lower()
             value = value or ""
 
-            # onclick=, onload=, onerror=, etc.
             if name.startswith("on"):
                 self.unsafe = True
                 return
 
-            # javascript: URLs
             if name in {
                 "href",
                 "src",
@@ -59,11 +56,9 @@ class SafetyParser(HTMLParser):
                 "formaction",
                 "xlink:href",
             }:
-                cleaned = value.strip()
-
                 if re.match(
                     r"^javascript\s*:",
-                    cleaned,
+                    value.strip(),
                     flags=re.IGNORECASE,
                 ):
                     self.unsafe = True
@@ -87,10 +82,7 @@ def unsafe_html(html):
 
 def evaluate(data):
 
-    # -----------------------------------------------------
-    # 1. TOP-LEVEL SCHEMA
-    # -----------------------------------------------------
-
+    # 1. Top-level schema
     if not isinstance(data, dict):
         return response("INVALID_SCHEMA")
 
@@ -134,10 +126,7 @@ def evaluate(data):
     if not isinstance(action["tool"], str):
         return response("INVALID_SCHEMA")
 
-    # -----------------------------------------------------
-    # 2. TOOL ALLOWLIST
-    # -----------------------------------------------------
-
+    # 2. Tool allowlist
     tool = action["tool"]
 
     if tool not in ALLOWED_TOOLS:
@@ -145,10 +134,7 @@ def evaluate(data):
 
     args = action["args"]
 
-    # -----------------------------------------------------
-    # 3. TOOL ARGUMENT SCHEMA
-    # -----------------------------------------------------
-
+    # 3. Tool argument schema
     if not isinstance(args, dict):
         return response("INVALID_SCHEMA")
 
@@ -165,7 +151,6 @@ def evaluate(data):
         if not (1 <= len(query) <= 200):
             return response("INVALID_SCHEMA")
 
-
     elif tool == "lookup_record":
 
         if set(args.keys()) != {"tenantId", "recordId"}:
@@ -177,9 +162,8 @@ def evaluate(data):
         if not isinstance(args["recordId"], str):
             return response("INVALID_SCHEMA")
 
-        if len(args["recordId"]) == 0:
+        if not args["recordId"]:
             return response("INVALID_SCHEMA")
-
 
     elif tool == "send_email":
 
@@ -187,11 +171,10 @@ def evaluate(data):
             return response("INVALID_SCHEMA")
 
         if not all(
-            isinstance(args[k], str)
-            for k in ("to", "subject", "body")
+            isinstance(args[key], str)
+            for key in ("to", "subject", "body")
         ):
             return response("INVALID_SCHEMA")
-
 
     elif tool == "render_html":
 
@@ -201,18 +184,12 @@ def evaluate(data):
         if not isinstance(args["html"], str):
             return response("INVALID_SCHEMA")
 
-    # -----------------------------------------------------
-    # 4. TENANT SCOPE
-    # -----------------------------------------------------
-
+    # 4. Tenant scope
     if tool == "lookup_record":
         if args["tenantId"] != TENANT:
             return response("TENANT_SCOPE")
 
-    # -----------------------------------------------------
-    # 5. EMAIL EGRESS
-    # -----------------------------------------------------
-
+    # 5. Email egress
     if tool == "send_email":
 
         address = args["to"]
@@ -228,18 +205,12 @@ def evaluate(data):
         if domain.lower() != EMAIL_DOMAIN.lower():
             return response("EGRESS_DENIED")
 
-    # -----------------------------------------------------
-    # 6. HUMAN APPROVAL
-    # -----------------------------------------------------
-
+    # 6. Human approval
     if tool == "send_email":
         if data["humanApproved"] is not True:
             return response("APPROVAL_REQUIRED")
 
-    # -----------------------------------------------------
-    # 7. HTML SAFETY
-    # -----------------------------------------------------
-
+    # 7. HTML safety
     if tool == "render_html":
         if unsafe_html(args["html"]):
             return response("UNSAFE_OUTPUT")
@@ -259,7 +230,7 @@ async def action_firewall(request: Request):
 
 
 # =========================================================
-# TERRAFORM PLAN POLICY
+# 2. TERRAFORM PLAN POLICY
 # =========================================================
 
 PROD_WORKSPACE = "prod-fji7r9"
@@ -305,10 +276,7 @@ def terraform_response(reason):
 
 def evaluate_terraform(data):
 
-    # -----------------------------------------------------
     # 1. INVALID_PLAN
-    # -----------------------------------------------------
-
     if not isinstance(data, dict):
         return terraform_response("INVALID_PLAN")
 
@@ -335,10 +303,7 @@ def evaluate_terraform(data):
     if not isinstance(state, dict):
         return terraform_response("INVALID_PLAN")
 
-    if set(state.keys()) != {
-        "backend",
-        "locked",
-    }:
+    if set(state.keys()) != {"backend", "locked"}:
         return terraform_response("INVALID_PLAN")
 
     if not isinstance(state["backend"], str):
@@ -371,13 +336,10 @@ def evaluate_terraform(data):
     if not isinstance(resource["action"], str):
         return terraform_response("INVALID_PLAN")
 
-    if not isinstance(resource["labels"], dict):
-        return terraform_response("INVALID_PLAN")
-
-    if not isinstance(resource["forceDestroy"], bool):
-        return terraform_response("INVALID_PLAN")
-
     if resource["action"] not in VALID_ACTIONS:
+        return terraform_response("INVALID_PLAN")
+
+    if not isinstance(resource["labels"], dict):
         return terraform_response("INVALID_PLAN")
 
     if not all(
@@ -391,45 +353,32 @@ def evaluate_terraform(data):
     if secret is not None and not isinstance(secret, str):
         return terraform_response("INVALID_PLAN")
 
-    # -----------------------------------------------------
-    # 2. ENVIRONMENT_MISMATCH
-    # -----------------------------------------------------
+    if not isinstance(resource["forceDestroy"], bool):
+        return terraform_response("INVALID_PLAN")
 
+    # 2. ENVIRONMENT_MISMATCH
     if data["environment"] != PROD_WORKSPACE:
         return terraform_response("ENVIRONMENT_MISMATCH")
 
-    # -----------------------------------------------------
     # 3. STATE_UNSAFE
-    # -----------------------------------------------------
-
     if (
         state["backend"] not in SAFE_BACKENDS
         or state["locked"] is not True
     ):
         return terraform_response("STATE_UNSAFE")
 
-    # -----------------------------------------------------
     # 4. UNPINNED_PROVIDER
-    # -----------------------------------------------------
-
     if data["providerVersion"] not in PINNED_PROVIDERS:
         return terraform_response("UNPINNED_PROVIDER")
 
-    # -----------------------------------------------------
     # 5. MISSING_LABELS
-    # -----------------------------------------------------
-
     labels = resource["labels"]
 
     for key, required_value in REQUIRED_LABELS.items():
-
         if labels.get(key) != required_value:
             return terraform_response("MISSING_LABELS")
 
-    # -----------------------------------------------------
     # 6. PLAINTEXT_SECRET
-    # -----------------------------------------------------
-
     if secret is not None:
 
         if not secret.startswith("secret://"):
@@ -438,10 +387,7 @@ def evaluate_terraform(data):
         if len(secret) <= len("secret://"):
             return terraform_response("PLAINTEXT_SECRET")
 
-    # -----------------------------------------------------
     # 7. DELETE_NOT_APPROVED
-    # -----------------------------------------------------
-
     if (
         resource["action"] == "delete"
         and resource["type"] in PROTECTED_DELETE_TYPES
@@ -449,10 +395,7 @@ def evaluate_terraform(data):
     ):
         return terraform_response("DELETE_NOT_APPROVED")
 
-    # -----------------------------------------------------
     # 8. FORCE_DESTROY
-    # -----------------------------------------------------
-
     if (
         resource["type"] == "storage_bucket"
         and resource["forceDestroy"] is True
@@ -474,10 +417,8 @@ async def terraform_plan(request: Request):
 
 
 # =========================================================
-# MODEL OUTPUT SANITIZER
+# 3. MODEL OUTPUT SANITIZER
 # =========================================================
-
-from urllib.parse import unquote, urlsplit
 
 SANITIZER_ALLOWED_HOSTS = {
     "cdn-bp1t5xs.example",
@@ -500,12 +441,12 @@ def sanitize_response(reason):
     }
 
 
-# =========================================================
-# ONE-PASS DECODING
-# percent -> HTML entities -> \uXXXX
-# =========================================================
+# ---------------------------------------------------------
+# Decode once:
+# percent escapes -> HTML entities -> \uXXXX
+# ---------------------------------------------------------
 
-def decode_entities_once(text):
+def decode_html_entities_once(text):
 
     named = {
         "lt": "<",
@@ -522,6 +463,7 @@ def decode_entities_once(text):
     def replace(match):
 
         try:
+
             if match.group(1) is not None:
                 value = int(match.group(1), 10)
 
@@ -545,6 +487,7 @@ def decode_entities_once(text):
 def decode_unicode_once(text):
 
     def replace(match):
+
         try:
             return chr(int(match.group(1), 16))
         except (ValueError, OverflowError):
@@ -559,16 +502,123 @@ def decode_unicode_once(text):
 
 def decode_once(text):
 
-    text = unquote(text)
-    text = decode_entities_once(text)
-    text = decode_unicode_once(text)
+    result = unquote(text)
+    result = decode_html_entities_once(result)
+    result = decode_unicode_once(result)
 
-    return text
+    return result
 
 
-# =========================================================
-# HTML PARSING
-# =========================================================
+# ---------------------------------------------------------
+# Parse actual HTML attributes
+# ---------------------------------------------------------
+
+def parse_raw_start_tag_attributes(raw):
+
+    attributes = []
+
+    n = len(raw)
+    i = 0
+
+    if i < n and raw[i] == "<":
+        i += 1
+
+    while i < n and raw[i].isspace():
+        i += 1
+
+    if i < n and raw[i] == "/":
+        i += 1
+
+    # Skip tag name
+    while (
+        i < n
+        and not raw[i].isspace()
+        and raw[i] not in "/>"
+    ):
+        i += 1
+
+    while i < n:
+
+        while i < n and raw[i].isspace():
+            i += 1
+
+        if i >= n or raw[i] == ">":
+            break
+
+        if raw[i] == "/":
+            i += 1
+            continue
+
+        name_start = i
+
+        while (
+            i < n
+            and not raw[i].isspace()
+            and raw[i] not in "=/>"
+        ):
+            i += 1
+
+        if i == name_start:
+            i += 1
+            continue
+
+        name = raw[name_start:i].lower()
+
+        while i < n and raw[i].isspace():
+            i += 1
+
+        has_equals = False
+        quoted = False
+        value = None
+
+        if i < n and raw[i] == "=":
+
+            has_equals = True
+            i += 1
+
+            while i < n and raw[i].isspace():
+                i += 1
+
+            if i < n and raw[i] in {"'", '"'}:
+
+                quoted = True
+                quote = raw[i]
+                i += 1
+
+                value_start = i
+
+                while i < n and raw[i] != quote:
+                    i += 1
+
+                value = raw[value_start:i]
+
+                if i < n and raw[i] == quote:
+                    i += 1
+
+            else:
+
+                value_start = i
+
+                while (
+                    i < n
+                    and not raw[i].isspace()
+                    and raw[i] != ">"
+                ):
+                    i += 1
+
+                value = raw[value_start:i]
+
+        attributes.append(
+            {
+                "name": name,
+                "has_equals": has_equals,
+                "quoted": quoted,
+                "value": value,
+            }
+        )
+
+    return attributes
+
 
 class OutputHTMLParser(HTMLParser):
 
@@ -594,34 +644,26 @@ class OutputHTMLParser(HTMLParser):
 
         raw = self.get_starttag_text() or ""
 
-        # Exact rule is an on...= attribute.
-        #
-        # onclick="x"      -> dangerous
-        # onload=x         -> dangerous
-        # onclick          -> NOT matched
-        # data-onclick="x" -> NOT matched
-        if re.search(
-            r"\s+on[^\s=/>]*\s*=",
-            raw,
-            flags=re.IGNORECASE,
-        ):
-            self.has_event_handler = True
+        for attr in parse_raw_start_tag_attributes(raw):
 
-        # Only QUOTED src= and href= values are extracted.
-        #
-        # src="..."
-        # href='...'
-        #
-        # data-href= does not count.
-        pattern = re.compile(
-            r"""\s+(?:src|href)\s*=\s*(["'])(.*?)\1""",
-            flags=re.IGNORECASE | re.DOTALL,
-        )
+            name = attr["name"]
 
-        for match in pattern.finditer(raw):
-            self.urls.append(
-                match.group(2).strip()
-            )
+            # EVENT_HANDLER requires on...=
+            if (
+                name.startswith("on")
+                and attr["has_equals"]
+            ):
+                self.has_event_handler = True
+
+            # Extract only QUOTED src/href values
+            if (
+                name in {"src", "href"}
+                and attr["has_equals"]
+                and attr["quoted"]
+            ):
+                self.urls.append(
+                    (attr["value"] or "").strip()
+                )
 
     def handle_starttag(self, tag, attrs):
         self.inspect_tag(tag)
@@ -643,9 +685,9 @@ def inspect_html(text):
     return parser
 
 
-# =========================================================
-# MARKDOWN DESTINATION EXTRACTION
-# =========================================================
+# ---------------------------------------------------------
+# Markdown URL extraction
+# ---------------------------------------------------------
 
 def extract_markdown_urls(text):
 
@@ -690,35 +732,31 @@ def extract_markdown_urls(text):
 
         inside = text[start + 2:i].strip()
 
-        # Markdown <URL> destination
         if inside.startswith("<"):
 
-            end = inside.find(">")
+            closing = inside.find(">")
 
-            if end != -1:
-                destination = inside[1:end].strip()
+            if closing != -1:
+                target = inside[1:closing].strip()
             else:
-                destination = inside
+                target = inside
 
         else:
-            # Destination is before an optional Markdown title.
-            #
-            # [x](https://host/path "title")
-            #
-            # Parentheses within a URL are preserved.
+
+            # Extract destination before optional Markdown title.
             j = 0
             nested = 0
-            escaped2 = False
+            escaped_inner = False
 
             while j < len(inside):
 
                 ch = inside[j]
 
-                if escaped2:
-                    escaped2 = False
+                if escaped_inner:
+                    escaped_inner = False
 
                 elif ch == "\\":
-                    escaped2 = True
+                    escaped_inner = True
 
                 elif ch == "(":
                     nested += 1
@@ -731,27 +769,25 @@ def extract_markdown_urls(text):
 
                 j += 1
 
-            destination = inside[:j].strip()
+            target = inside[:j].strip()
 
-        if destination:
-            urls.append(destination)
+        if target:
+            urls.append(target)
 
         position = i + 1
 
     return urls
 
 
-# =========================================================
-# SCHEME / HOST CHECKS
-# =========================================================
+# ---------------------------------------------------------
+# Scheme and hostname checks
+# ---------------------------------------------------------
 
 def contains_forbidden_scheme(text):
 
-    # Treat these as actual scheme tokens rather than matching
-    # the end of an unrelated word such as "metadata:".
+    # The prompt says the TEXT CONTAINS these schemes.
     return bool(
         re.search(
-            r"(?<![A-Za-z0-9+.-])"
             r"(?:javascript|data|vbscript)\s*:",
             text,
             flags=re.IGNORECASE,
@@ -759,7 +795,7 @@ def contains_forbidden_scheme(text):
     )
 
 
-def get_explicit_scheme(value):
+def explicit_scheme(value):
 
     value = value.strip()
 
@@ -777,16 +813,16 @@ def get_explicit_scheme(value):
     return match.group(1).lower()
 
 
-def dangerous_scheme(text, urls):
+def has_dangerous_scheme(text, urls):
 
     # javascript:, data:, vbscript: anywhere in text
     if contains_forbidden_scheme(text):
         return True
 
-    # Any extracted explicit scheme other than http/https
+    # Extracted URLs: only http/https schemes permitted
     for value in urls:
 
-        scheme = get_explicit_scheme(value)
+        scheme = explicit_scheme(value)
 
         if (
             scheme is not None
@@ -797,26 +833,26 @@ def dangerous_scheme(text, urls):
     return False
 
 
-def external_exfil(urls):
+def has_external_exfil(urls):
 
     for value in urls:
 
         value = value.strip()
 
-        # //host/path is absolute, interpreted as https
+        # Protocol-relative is absolute
         if value.startswith("//"):
 
             candidate = "https:" + value
 
         else:
 
-            scheme = get_explicit_scheme(value)
+            scheme = explicit_scheme(value)
 
             # Relative reference
             if scheme is None:
                 continue
 
-            # Other schemes already handled by DANGEROUS_SCHEME
+            # Non-http/https already handled above
             if scheme not in {"http", "https"}:
                 continue
 
@@ -832,38 +868,38 @@ def external_exfil(urls):
         if hostname is None:
             return True
 
-        # EXACT hostname comparison.
+        # Exact hostname only
         if hostname.lower() not in SANITIZER_ALLOWED_HOSTS:
             return True
 
     return False
 
 
-# =========================================================
-# CHANNEL RULES
-# =========================================================
+# ---------------------------------------------------------
+# Channel rules
+# ---------------------------------------------------------
 
 def html_violation(text):
 
-    parser = inspect_html(text)
+    inspector = inspect_html(text)
 
     # 1. SCRIPT_TAG
-    if parser.has_script_tag:
+    if inspector.has_script_tag:
         return "SCRIPT_TAG"
 
     # 2. EVENT_HANDLER
-    if parser.has_event_handler:
+    if inspector.has_event_handler:
         return "EVENT_HANDLER"
 
     # 3. DANGEROUS_SCHEME
-    if dangerous_scheme(
+    if has_dangerous_scheme(
         text,
-        parser.urls,
+        inspector.urls,
     ):
         return "DANGEROUS_SCHEME"
 
     # 4. EXTERNAL_EXFIL
-    if external_exfil(parser.urls):
+    if has_external_exfil(inspector.urls):
         return "EXTERNAL_EXFIL"
 
     return "SAFE"
@@ -873,12 +909,10 @@ def markdown_violation(text):
 
     urls = extract_markdown_urls(text)
 
-    # 1. DANGEROUS_SCHEME
-    if dangerous_scheme(text, urls):
+    if has_dangerous_scheme(text, urls):
         return "DANGEROUS_SCHEME"
 
-    # 2. EXTERNAL_EXFIL
-    if external_exfil(urls):
+    if has_external_exfil(urls):
         return "EXTERNAL_EXFIL"
 
     return "SAFE"
@@ -886,14 +920,13 @@ def markdown_violation(text):
 
 def url_violation(text):
 
-    urls = [text.strip()]
+    value = text.strip()
+    urls = [value]
 
-    # 1. DANGEROUS_SCHEME
-    if dangerous_scheme(text, urls):
+    if has_dangerous_scheme(text, urls):
         return "DANGEROUS_SCHEME"
 
-    # 2. EXTERNAL_EXFIL
-    if external_exfil(urls):
+    if has_external_exfil(urls):
         return "EXTERNAL_EXFIL"
 
     return "SAFE"
@@ -935,10 +968,7 @@ def sql_violation(text):
 
 def shell_violation(text):
 
-    if re.search(
-        r"[;&|`<>]",
-        text,
-    ):
+    if re.search(r"[;&|`<>]", text):
         return "SHELL_METACHAR"
 
     if "$(" in text:
@@ -970,21 +1000,24 @@ def channel_violation(channel, text):
     return "SAFE"
 
 
-# =========================================================
-# MAIN SANITIZER
-# =========================================================
+# ---------------------------------------------------------
+# Main sanitizer policy
+# ---------------------------------------------------------
 
 def evaluate_sanitizer(data):
 
-    # -----------------------------------------------------
     # 1. INVALID_SCHEMA
-    # -----------------------------------------------------
-
     if not isinstance(data, dict):
         return sanitize_response("INVALID_SCHEMA")
 
     channel = data.get("channel")
     output = data.get("output")
+
+    # IMPORTANT:
+    # Type-check before using set membership.
+    # Otherwise [] / {} can cause an unhashable-type 500.
+    if not isinstance(channel, str):
+        return sanitize_response("INVALID_SCHEMA")
 
     if channel not in SANITIZER_CHANNELS:
         return sanitize_response("INVALID_SCHEMA")
@@ -995,10 +1028,7 @@ def evaluate_sanitizer(data):
     if len(output) > 20000:
         return sanitize_response("INVALID_SCHEMA")
 
-    # -----------------------------------------------------
     # 2. ENCODED_PAYLOAD
-    # -----------------------------------------------------
-
     decoded = decode_once(output)
 
     if decoded != output:
@@ -1013,10 +1043,7 @@ def evaluate_sanitizer(data):
                 "ENCODED_PAYLOAD"
             )
 
-    # -----------------------------------------------------
-    # 3. ORIGINAL STRING
-    # -----------------------------------------------------
-
+    # 3. Rules on original output
     reason = channel_violation(
         channel,
         output,
@@ -1037,3 +1064,19 @@ async def sanitize_output(request: Request):
         )
 
     return evaluate_sanitizer(data)
+
+
+# =========================================================
+# HEALTH CHECK
+# =========================================================
+
+@app.get("/")
+def root():
+    return {
+        "ok": True,
+        "endpoints": [
+            "/action-firewall",
+            "/terraform/plan",
+            "/sanitize-output",
+        ],
+        }
