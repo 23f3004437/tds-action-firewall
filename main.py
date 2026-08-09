@@ -477,6 +477,8 @@ async def terraform_plan(request: Request):
 # MODEL OUTPUT SANITIZER
 # =========================================================
 
+from urllib.parse import unquote, urlsplit
+
 SANITIZER_ALLOWED_HOSTS = {
     "cdn-bp1t5xs.example",
     "app-5z1e5jh.example",
@@ -498,12 +500,12 @@ def sanitize_response(reason):
     }
 
 
-# ---------------------------------------------------------
-# Decode exactly once:
+# =========================================================
+# ONE-PASS DECODING
 # percent -> HTML entities -> \uXXXX
-# ---------------------------------------------------------
+# =========================================================
 
-def decode_html_entities_once(text):
+def decode_entities_once(text):
 
     named = {
         "lt": "<",
@@ -514,13 +516,12 @@ def decode_html_entities_once(text):
     }
 
     pattern = re.compile(
-        r"&(?:#([0-9]+)|#x([0-9a-fA-F]+)|(lt|gt|quot|apos|amp));"
+        r"&(?:#([0-9]+)|#[xX]([0-9a-fA-F]+)|(lt|gt|quot|apos|amp));"
     )
 
     def replace(match):
 
         try:
-
             if match.group(1) is not None:
                 value = int(match.group(1), 10)
 
@@ -530,22 +531,20 @@ def decode_html_entities_once(text):
             else:
                 return named[match.group(3)]
 
-            # Avoid invalid Unicode code points
-            if value < 0 or value > 0x10FFFF:
-                return match.group(0)
-
-            return chr(value)
+            if 0 <= value <= 0x10FFFF:
+                return chr(value)
 
         except (ValueError, OverflowError):
-            return match.group(0)
+            pass
+
+        return match.group(0)
 
     return pattern.sub(replace, text)
 
 
-def decode_unicode_escapes_once(text):
+def decode_unicode_once(text):
 
     def replace(match):
-
         try:
             return chr(int(match.group(1), 16))
         except (ValueError, OverflowError):
@@ -560,94 +559,80 @@ def decode_unicode_escapes_once(text):
 
 def decode_once(text):
 
-    result = unquote(text)
-    result = decode_html_entities_once(result)
-    result = decode_unicode_escapes_once(result)
+    text = unquote(text)
+    text = decode_entities_once(text)
+    text = decode_unicode_once(text)
 
-    return result
-
-
-# ---------------------------------------------------------
-# HTML inspection
-# ---------------------------------------------------------
-
-def extract_quoted_html_urls_from_tag(raw_tag):
-    """
-    Extract only actual quoted src= and href= attributes.
-
-    Correct:
-      href="..."
-      src='...'
-
-    Not treated as src/href:
-      data-href="..."
-      x-src="..."
-      href=unquoted
-    """
-
-    urls = []
-
-    # Attribute name must be separated from previous token by
-    # whitespace and must itself be exactly src or href.
-    pattern = re.compile(
-        r"""(?is)(?:\s)(src|href)\s*=\s*(["'])(.*?)\2"""
-    )
-
-    for match in pattern.finditer(raw_tag):
-        urls.append(match.group(3).strip())
-
-    return urls
+    return text
 
 
-class SanitizerHTMLParser(HTMLParser):
+# =========================================================
+# HTML PARSING
+# =========================================================
+
+class OutputHTMLParser(HTMLParser):
 
     def __init__(self):
         super().__init__(convert_charrefs=False)
 
-        self.script_tag = False
-        self.event_handler = False
+        self.has_script_tag = False
+        self.has_event_handler = False
         self.urls = []
 
-    def inspect(self, tag, attrs):
+    def inspect_tag(self, tag):
 
         tag = (tag or "").lower()
 
-        # SCRIPT_TAG
+        # Opening script / iframe / object / embed
         if tag in {
             "script",
             "iframe",
             "object",
             "embed",
         }:
-            self.script_tag = True
+            self.has_script_tag = True
 
-        # EVENT_HANDLER
-        for name, value in attrs:
+        raw = self.get_starttag_text() or ""
 
-            name = (name or "").lower()
+        # Exact rule is an on...= attribute.
+        #
+        # onclick="x"      -> dangerous
+        # onload=x         -> dangerous
+        # onclick          -> NOT matched
+        # data-onclick="x" -> NOT matched
+        if re.search(
+            r"\s+on[^\s=/>]*\s*=",
+            raw,
+            flags=re.IGNORECASE,
+        ):
+            self.has_event_handler = True
 
-            # Actual attribute name itself must begin with "on".
-            # data-onclick does not match.
-            if name.startswith("on"):
-                self.event_handler = True
+        # Only QUOTED src= and href= values are extracted.
+        #
+        # src="..."
+        # href='...'
+        #
+        # data-href= does not count.
+        pattern = re.compile(
+            r"""\s+(?:src|href)\s*=\s*(["'])(.*?)\1""",
+            flags=re.IGNORECASE | re.DOTALL,
+        )
 
-        raw = self.get_starttag_text()
-
-        if raw:
-            self.urls.extend(
-                extract_quoted_html_urls_from_tag(raw)
+        for match in pattern.finditer(raw):
+            self.urls.append(
+                match.group(2).strip()
             )
 
     def handle_starttag(self, tag, attrs):
-        self.inspect(tag, attrs)
+        self.inspect_tag(tag)
 
     def handle_startendtag(self, tag, attrs):
-        self.inspect(tag, attrs)
+        self.inspect_tag(tag)
 
 
 def inspect_html(text):
 
-    parser = SanitizerHTMLParser()
+    parser = OutputHTMLParser()
 
     try:
         parser.feed(text)
@@ -658,41 +643,115 @@ def inspect_html(text):
     return parser
 
 
-# ---------------------------------------------------------
-# Markdown URL extraction
-# ---------------------------------------------------------
+# =========================================================
+# MARKDOWN DESTINATION EXTRACTION
+# =========================================================
 
 def extract_markdown_urls(text):
 
     urls = []
+    position = 0
 
-    # The problem defines a Markdown URL as the target inside ](...)
-    pattern = re.compile(
-        r"\]\(\s*([^)]+?)\s*\)",
-        flags=re.DOTALL,
-    )
+    while True:
 
-    for match in pattern.finditer(text):
+        start = text.find("](", position)
 
-        target = match.group(1).strip()
+        if start == -1:
+            break
 
-        # Also tolerate Markdown's <https://...> target form
-        if target.startswith("<") and target.endswith(">"):
-            target = target[1:-1].strip()
+        i = start + 2
+        depth = 1
+        escaped = False
 
-        urls.append(target)
+        while i < len(text):
+
+            ch = text[i]
+
+            if escaped:
+                escaped = False
+
+            elif ch == "\\":
+                escaped = True
+
+            elif ch == "(":
+                depth += 1
+
+            elif ch == ")":
+                depth -= 1
+
+                if depth == 0:
+                    break
+
+            i += 1
+
+        if depth != 0:
+            position = start + 2
+            continue
+
+        inside = text[start + 2:i].strip()
+
+        # Markdown <URL> destination
+        if inside.startswith("<"):
+
+            end = inside.find(">")
+
+            if end != -1:
+                destination = inside[1:end].strip()
+            else:
+                destination = inside
+
+        else:
+            # Destination is before an optional Markdown title.
+            #
+            # [x](https://host/path "title")
+            #
+            # Parentheses within a URL are preserved.
+            j = 0
+            nested = 0
+            escaped2 = False
+
+            while j < len(inside):
+
+                ch = inside[j]
+
+                if escaped2:
+                    escaped2 = False
+
+                elif ch == "\\":
+                    escaped2 = True
+
+                elif ch == "(":
+                    nested += 1
+
+                elif ch == ")" and nested > 0:
+                    nested -= 1
+
+                elif ch.isspace() and nested == 0:
+                    break
+
+                j += 1
+
+            destination = inside[:j].strip()
+
+        if destination:
+            urls.append(destination)
+
+        position = i + 1
 
     return urls
 
 
-# ---------------------------------------------------------
-# URL policy
-# ---------------------------------------------------------
+# =========================================================
+# SCHEME / HOST CHECKS
+# =========================================================
 
-def contains_dangerous_scheme_text(text):
+def contains_forbidden_scheme(text):
 
+    # Treat these as actual scheme tokens rather than matching
+    # the end of an unrelated word such as "metadata:".
     return bool(
         re.search(
+            r"(?<![A-Za-z0-9+.-])"
             r"(?:javascript|data|vbscript)\s*:",
             text,
             flags=re.IGNORECASE,
@@ -700,66 +759,64 @@ def contains_dangerous_scheme_text(text):
     )
 
 
-def extracted_url_has_disallowed_scheme(value):
+def get_explicit_scheme(value):
 
     value = value.strip()
 
-    # //host/path is handled as an absolute HTTPS reference
     if value.startswith("//"):
-        return False
+        return None
 
     match = re.match(
-        r"^([A-Za-z][A-Za-z0-9+.-]*)\s*:",
+        r"^([A-Za-z][A-Za-z0-9+.-]*):",
         value,
     )
 
     if not match:
-        return False
+        return None
 
-    scheme = match.group(1).lower()
-
-    return scheme not in {"http", "https"}
+    return match.group(1).lower()
 
 
-def has_dangerous_scheme(text, urls):
+def dangerous_scheme(text, urls):
 
-    # Forbidden text appears anywhere
-    if contains_dangerous_scheme_text(text):
+    # javascript:, data:, vbscript: anywhere in text
+    if contains_forbidden_scheme(text):
         return True
 
-    # Any extracted URL with non-http(s) scheme
+    # Any extracted explicit scheme other than http/https
     for value in urls:
 
-        if extracted_url_has_disallowed_scheme(value):
+        scheme = get_explicit_scheme(value)
+
+        if (
+            scheme is not None
+            and scheme not in {"http", "https"}
+        ):
             return True
 
     return False
 
 
-def has_external_exfil(urls):
+def external_exfil(urls):
 
     for value in urls:
 
         value = value.strip()
 
-        # Protocol-relative URLs count as absolute HTTPS URLs
+        # //host/path is absolute, interpreted as https
         if value.startswith("//"):
+
             candidate = "https:" + value
 
         else:
 
-            match = re.match(
-                r"^([A-Za-z][A-Za-z0-9+.-]*)\s*:",
-                value,
-            )
+            scheme = get_explicit_scheme(value)
 
-            if not match:
-                # Relative URL
+            # Relative reference
+            if scheme is None:
                 continue
 
-            scheme = match.group(1).lower()
-
-            # Dangerous schemes are handled before EXTERNAL_EXFIL
+            # Other schemes already handled by DANGEROUS_SCHEME
             if scheme not in {"http", "https"}:
                 continue
 
@@ -775,38 +832,38 @@ def has_external_exfil(urls):
         if hostname is None:
             return True
 
-        # Exact hostname comparison only
+        # EXACT hostname comparison.
         if hostname.lower() not in SANITIZER_ALLOWED_HOSTS:
             return True
 
     return False
 
 
-# ---------------------------------------------------------
-# Channel rules
-# ---------------------------------------------------------
+# =========================================================
+# CHANNEL RULES
+# =========================================================
 
 def html_violation(text):
 
-    inspector = inspect_html(text)
+    parser = inspect_html(text)
 
     # 1. SCRIPT_TAG
-    if inspector.script_tag:
+    if parser.has_script_tag:
         return "SCRIPT_TAG"
 
     # 2. EVENT_HANDLER
-    if inspector.event_handler:
+    if parser.has_event_handler:
         return "EVENT_HANDLER"
 
     # 3. DANGEROUS_SCHEME
-    if has_dangerous_scheme(
+    if dangerous_scheme(
         text,
-        inspector.urls,
+        parser.urls,
     ):
         return "DANGEROUS_SCHEME"
 
     # 4. EXTERNAL_EXFIL
-    if has_external_exfil(inspector.urls):
+    if external_exfil(parser.urls):
         return "EXTERNAL_EXFIL"
 
     return "SAFE"
@@ -817,11 +874,11 @@ def markdown_violation(text):
     urls = extract_markdown_urls(text)
 
     # 1. DANGEROUS_SCHEME
-    if has_dangerous_scheme(text, urls):
+    if dangerous_scheme(text, urls):
         return "DANGEROUS_SCHEME"
 
     # 2. EXTERNAL_EXFIL
-    if has_external_exfil(urls):
+    if external_exfil(urls):
         return "EXTERNAL_EXFIL"
 
     return "SAFE"
@@ -829,15 +886,14 @@ def markdown_violation(text):
 
 def url_violation(text):
 
-    value = text.strip()
-    urls = [value]
+    urls = [text.strip()]
 
     # 1. DANGEROUS_SCHEME
-    if has_dangerous_scheme(text, urls):
+    if dangerous_scheme(text, urls):
         return "DANGEROUS_SCHEME"
 
     # 2. EXTERNAL_EXFIL
-    if has_external_exfil(urls):
+    if external_exfil(urls):
         return "EXTERNAL_EXFIL"
 
     return "SAFE"
@@ -845,26 +901,21 @@ def url_violation(text):
 
 def sql_violation(text):
 
-    # Single quote
     if "'" in text:
         return "SQL_METACHAR"
 
-    # Double quote
     if '"' in text:
         return "SQL_METACHAR"
 
-    # Semicolon
     if ";" in text:
         return "SQL_METACHAR"
 
-    # SQL comment tokens
     if "--" in text:
         return "SQL_METACHAR"
 
     if "/*" in text:
         return "SQL_METACHAR"
 
-    # Word UNION
     if re.search(
         r"\bunion\b",
         text,
@@ -872,9 +923,8 @@ def sql_violation(text):
     ):
         return "SQL_METACHAR"
 
-    # OR 1=1
     if re.search(
-        r"\bor\s+1\s*=\s*1",
+        r"\bor\s+1\s*=\s*1\b",
         text,
         flags=re.IGNORECASE,
     ):
@@ -885,14 +935,12 @@ def sql_violation(text):
 
 def shell_violation(text):
 
-    # Any of ; & | ` < >
     if re.search(
         r"[;&|`<>]",
         text,
     ):
         return "SHELL_METACHAR"
 
-    # $( or ${
     if "$(" in text:
         return "SHELL_METACHAR"
 
@@ -922,9 +970,9 @@ def channel_violation(channel, text):
     return "SAFE"
 
 
-# ---------------------------------------------------------
-# Sanitizer policy
-# ---------------------------------------------------------
+# =========================================================
+# MAIN SANITIZER
+# =========================================================
 
 def evaluate_sanitizer(data):
 
@@ -966,7 +1014,7 @@ def evaluate_sanitizer(data):
             )
 
     # -----------------------------------------------------
-    # 3. ORIGINAL OUTPUT
+    # 3. ORIGINAL STRING
     # -----------------------------------------------------
 
     reason = channel_violation(
@@ -989,19 +1037,3 @@ async def sanitize_output(request: Request):
         )
 
     return evaluate_sanitizer(data)
-
-
-# =========================================================
-# HEALTH CHECK
-# =========================================================
-
-@app.get("/")
-def root():
-    return {
-        "ok": True,
-        "endpoints": [
-            "/action-firewall",
-            "/terraform/plan",
-            "/sanitize-output",
-        ],
-                }
